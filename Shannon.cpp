@@ -78,11 +78,9 @@ void encodeFile(const string& inputFile, const string& outputFile) {
         return;
     }
 
-    // Write header: symbol count (1 byte)
     size_t symbol_count = codes.size();
     out.write(reinterpret_cast<const char*>(&symbol_count), sizeof(symbol_count));
 
-    // Write code table efficiently
     for (const auto& info : codes) {
         out.put(info.symbol);
         uint8_t code_length = info.code.size();
@@ -109,7 +107,6 @@ void encodeFile(const string& inputFile, const string& outputFile) {
         }
     }
 
-    // Encode data and pack bits into bytes
     unsigned char buffer = 0;
     int bit_pos = 0;
     for (unsigned char c : data) {
@@ -135,7 +132,6 @@ void encodeFile(const string& inputFile, const string& outputFile) {
 
     out.close();
 
-    // Calculate compression ratio
     ifstream orig(inputFile, ios::ate | ios::binary);
     ifstream comp(outputFile, ios::ate | ios::binary);
     size_t original_size = orig.tellg();
@@ -156,11 +152,9 @@ void decodeFile(const string& inputFile, const string& outputFile) {
         return;
     }
 
-    // Read header
     size_t symbol_count;
     in.read(reinterpret_cast<char*>(&symbol_count), sizeof(symbol_count));
 
-    // Read code table
     vector<SymbolInfo> codes;
     map<string, unsigned char> decode_map;
     for (size_t i = 0; i < symbol_count; ++i) {
@@ -168,7 +162,6 @@ void decodeFile(const string& inputFile, const string& outputFile) {
         info.symbol = in.get();
         uint8_t code_length = in.get();
 
-        // Read packed code bits
         string code_str;
         int bits_read = 0;
         while (bits_read < code_length) {
@@ -186,7 +179,6 @@ void decodeFile(const string& inputFile, const string& outputFile) {
         decode_map[code_str] = info.symbol;
     }
 
-    // Decode data
     ofstream out(outputFile, ios::binary);
     if (!out) {
         cerr << "Error: Cannot create output file!" << endl;
