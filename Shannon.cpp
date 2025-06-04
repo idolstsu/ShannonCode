@@ -1,308 +1,240 @@
-﻿#include <iostream>
+#include <iostream>
 #include <fstream>
 #include <vector>
 #include <map>
-#include <chrono>
-#include <cstdint>
-#include <locale>
 #include <cmath>
+#include <algorithm>
+#include <string>
+#include <limits>
+#include <cctype>
 
 using namespace std;
-using namespace std::chrono;
 
-const uint32_t MAX_FREQ = 16383;
-const uint32_t TOP = 0xFFFF;
-const uint32_t FIRST_QTR = (TOP + 1) / 4;
-const uint32_t HALF = 2 * FIRST_QTR;
-const uint32_t THIRD_QTR = 3 * FIRST_QTR;
-
-struct SymbolRange {
-    uint32_t low;
-    uint32_t high;
-    uint32_t count;
+struct SymbolInfo {
+    unsigned char symbol;
+    double probability;
+    string code;
 };
 
-map<char, uint32_t> calculateFrequencies(const string& text) {
-    map<char, uint32_t> freq;
-    for (char current_char : text) {
-        if (freq[current_char] < MAX_FREQ) freq[current_char]++;
-    }
-    return freq;
-}
+map<unsigned char, double> calculateProbabilities(const string& data) {
+    map<unsigned char, int> freq;
+    for (unsigned char c : data) freq[c]++;
 
-double calculateShannonEntropy(const map<char, uint32_t>& freq, uint32_t total) {
-    double entropy = 0.0;
+    map<unsigned char, double> prob;
+    int total = data.size();
     for (const auto& pair : freq) {
-        double pi = static_cast<double>(pair.second) / total;
-        if (pi > 0) {
-            entropy -= pi * log2(pi);
+        prob[pair.first] = static_cast<double>(pair.second) / total;
+    }
+    return prob;
+}
+
+vector<SymbolInfo> buildShannonCodes(const map<unsigned char, double>& probabilities) {
+    vector<SymbolInfo> symbols;
+    for (const auto& pair : probabilities) {
+        symbols.push_back({ pair.first, pair.second, "" });
+    }
+
+    sort(symbols.begin(), symbols.end(), [](const SymbolInfo& a, const SymbolInfo& b) {
+        return a.probability > b.probability;
+        });
+
+    double sum = 0.0;
+    for (auto& symbol : symbols) {
+        int code_length = ceil(log2(1.0 / symbol.probability));
+        double q = sum;
+        sum += symbol.probability;
+
+        string code;
+        for (int i = 0; i < code_length; ++i) {
+            q *= 2;
+            code += (q >= 1.0) ? '1' : '0';
+            if (q >= 1.0) q -= 1.0;
+        }
+        symbol.code = code;
+    }
+    return symbols;
+}
+
+void encodeFile(const string& inputFile, const string& outputFile) {
+    ifstream in(inputFile, ios::binary);
+    if (!in) {
+        cerr << "Error: Cannot open input file!" << endl;
+        return;
+    }
+
+    string data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    auto probabilities = calculateProbabilities(data);
+    auto codes = buildShannonCodes(probabilities);
+    map<unsigned char, string> code_map;
+    for (const auto& info : codes) {
+        code_map[info.symbol] = info.code;
+    }
+
+    ofstream out(outputFile, ios::binary);
+    if (!out) {
+        cerr << "Error: Cannot create output file!" << endl;
+        return;
+    }
+
+    // Write header: symbol count (1 byte)
+    size_t symbol_count = codes.size();
+    out.write(reinterpret_cast<const char*>(&symbol_count), sizeof(symbol_count));
+
+    // Write code table efficiently
+    for (const auto& info : codes) {
+        out.put(info.symbol);
+        uint8_t code_length = info.code.size();
+        out.put(code_length);
+
+        // Pack code bits into bytes
+        unsigned char buffer = 0;
+        int bit_pos = 0;
+        for (char bit : info.code) {
+            if (bit == '1') {
+                buffer |= (1 << (7 - bit_pos));
+            }
+            bit_pos++;
+
+            if (bit_pos == 8) {
+                out.put(buffer);
+                buffer = 0;
+                bit_pos = 0;
+            }
+        }
+        // Write remaining bits if any
+        if (bit_pos > 0) {
+            out.put(buffer);
         }
     }
-    return entropy;
-}
 
-void buildCumulativeFreq(const map<char, uint32_t>& freq, map<char, SymbolRange>& ranges, uint32_t& total) {
-    uint32_t cumulative = 0;
-    total = 0;
-    for (const auto& pair : freq) total += pair.second;
-    for (const auto& pair : freq) {
-        ranges[pair.first] = { cumulative, cumulative + pair.second, total };
-        cumulative += pair.second;
-    }
-}
+    // Encode data and pack bits into bytes
+    unsigned char buffer = 0;
+    int bit_pos = 0;
+    for (unsigned char c : data) {
+        const string& code = code_map[c];
+        for (char bit : code) {
+            if (bit == '1') {
+                buffer |= (1 << (7 - bit_pos));
+            }
+            bit_pos++;
 
-void writeBitVector(ofstream& out, const vector<bool>& bits) {
-    uint32_t bitSize = bits.size();
-    out.write(reinterpret_cast<const char*>(&bitSize), sizeof(bitSize));
-
-    uint8_t byte = 0;
-    int bit_count = 0;
-    for (bool bit : bits) {
-        byte = (byte << 1) | (bit ? 1 : 0);
-        bit_count++;
-        if (bit_count == 8) {
-            out.put(static_cast<char>(byte));
-            byte = 0;
-            bit_count = 0;
+            if (bit_pos == 8) {
+                out.put(buffer);
+                buffer = 0;
+                bit_pos = 0;
+            }
         }
     }
-    if (bit_count > 0) {
-        byte <<= (8 - bit_count);
-        out.put(static_cast<char>(byte));
+
+    // Write remaining bits if any
+    if (bit_pos > 0) {
+        out.put(buffer);
     }
+
+    out.close();
+
+    // Calculate compression ratio
+    ifstream orig(inputFile, ios::ate | ios::binary);
+    ifstream comp(outputFile, ios::ate | ios::binary);
+    size_t original_size = orig.tellg();
+    size_t compressed_size = comp.tellg();
+    orig.close();
+    comp.close();
+
+    cout << "File successfully encoded." << endl;
+    cout << "Original size: " << original_size << " bytes" << endl;
+    cout << "Compressed size: " << compressed_size << " bytes" << endl;
+    cout << "Compression ratio: " << (compressed_size * 100 / original_size) << "%" << endl;
 }
 
-vector<bool> readBitVector(ifstream& in) {
-    uint32_t bitSize;
-    in.read(reinterpret_cast<char*>(&bitSize), sizeof(bitSize));
-    vector<bool> bits;
-    bits.reserve(bitSize);
-    char byte;
-    while (in.get(byte) && bits.size() < bitSize) {
-        for (int i = 7; i >= 0 && bits.size() < bitSize; i--) {
-            bits.push_back((byte >> i) & 1);
-        }
+void decodeFile(const string& inputFile, const string& outputFile) {
+    ifstream in(inputFile, ios::binary);
+    if (!in) {
+        cerr << "Error: Cannot open input file!" << endl;
+        return;
     }
-    return bits;
-}
 
-void compressFile(ifstream& in, ofstream& out) {
-    auto start = high_resolution_clock::now();
+    // Read header
+    size_t symbol_count;
+    in.read(reinterpret_cast<char*>(&symbol_count), sizeof(symbol_count));
 
-    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
-    size_t original_size = text.size();
+    // Read code table
+    vector<SymbolInfo> codes;
+    map<string, unsigned char> decode_map;
+    for (size_t i = 0; i < symbol_count; ++i) {
+        SymbolInfo info;
+        info.symbol = in.get();
+        uint8_t code_length = in.get();
 
-    map<char, uint32_t> freq = calculateFrequencies(text);
-    map<char, SymbolRange> ranges;
-    uint32_t total = 0;
-    buildCumulativeFreq(freq, ranges, total);
-
-    double entropy = calculateShannonEntropy(freq, total);
-    cout << "Shannon Entropy: " << entropy << " bits per symbol\n";
-
-    uint32_t low = 0;
-    uint32_t high = TOP;
-    uint32_t pending_bits = 0;
-    vector<bool> output_bits;
-
-    for (char current_char : text) {
-        uint32_t range = high - low + 1;
-        const SymbolRange& current_range = ranges[current_char];
-
-        high = low + (range * current_range.high) / current_range.count - 1;
-        low = low + (range * current_range.low) / current_range.count;
-
-        while (true) {
-            if (high < HALF) {
-                output_bits.push_back(false);
-                while (pending_bits > 0) {
-                    output_bits.push_back(true);
-                    pending_bits--;
+        // Read packed code bits
+        string code_str;
+        int bits_read = 0;
+        while (bits_read < code_length) {
+            unsigned char byte = in.get();
+            for (int j = 7; j >= 0 && bits_read < code_length; j--, bits_read++) {
+                if (byte & (1 << j)) {
+                    code_str += '1';
                 }
-                low <<= 1;
-                high = (high << 1) | 1;
-            }
-            else if (low >= HALF) {
-                output_bits.push_back(true);
-                while (pending_bits > 0) {
-                    output_bits.push_back(false);
-                    pending_bits--;
+                else {
+                    code_str += '0';
                 }
-                low = (low - HALF) << 1;
-                high = ((high - HALF) << 1) | 1;
-            }
-            else if (low >= FIRST_QTR && high < THIRD_QTR) {
-                pending_bits++;
-                low = (low - FIRST_QTR) << 1;
-                high = ((high - FIRST_QTR) << 1) | 1;
-            }
-            else break;
-        }
-    }
-
-    pending_bits++;
-    if (low < FIRST_QTR) {
-        output_bits.push_back(false);
-        while (pending_bits-- > 0) output_bits.push_back(true);
-    }
-    else {
-        output_bits.push_back(true);
-        while (pending_bits-- > 0) output_bits.push_back(false);
-    }
-
-    uint32_t freq_size = static_cast<uint32_t>(freq.size());
-    out.write(reinterpret_cast<const char*>(&freq_size), sizeof(freq_size));
-    for (const auto& pair : freq) {
-        out.put(pair.first);
-        out.write(reinterpret_cast<const char*>(&pair.second), sizeof(pair.second));
-    }
-
-    uint32_t text_size = static_cast<uint32_t>(text.size());
-    out.write(reinterpret_cast<const char*>(&text_size), sizeof(text_size));
-
-    writeBitVector(out, output_bits);
-
-    auto end = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end - start);
-    size_t compressed_size = (output_bits.size() + 7) / 8;
-
-    cout << "\nCompression results:\n";
-    cout << "Original size: " << original_size << " bytes\n";
-    cout << "Compressed size: " << compressed_size << " bytes\n";
-    cout << "Compression ratio: "
-        << (1.0 - (double)compressed_size / original_size) * 100
-        << "%\n";
-    cout << "Time taken: " << duration.count() << " ms\n";
-}
-
-void decompressFile(ifstream& in, ofstream& out) {
-    auto start = high_resolution_clock::now();
-
-    uint32_t freq_size;
-    in.read(reinterpret_cast<char*>(&freq_size), sizeof(freq_size));
-
-    map<char, uint32_t> freq;
-    for (uint32_t i = 0; i < freq_size; i++) {
-        char current_char;
-        uint32_t frequency;
-        in.get(current_char);
-        in.read(reinterpret_cast<char*>(&frequency), sizeof(frequency));
-        freq[current_char] = frequency;
-    }
-
-    uint32_t text_size;
-    in.read(reinterpret_cast<char*>(&text_size), sizeof(text_size));
-
-    vector<bool> bits = readBitVector(in);
-    map<char, SymbolRange> ranges;
-    uint32_t total = 0;
-    buildCumulativeFreq(freq, ranges, total);
-
-    string result;
-    result.reserve(text_size);
-
-    uint32_t value = 0;
-    size_t bit_index = 0;
-    for (int i = 0; i < 16 && bit_index < bits.size(); i++) {
-        value = (value << 1) | (bits[bit_index++] ? 1 : 0);
-    }
-
-    uint32_t low = 0, high = TOP;
-
-    for (uint32_t i = 0; i < text_size; i++) {
-        uint32_t range = high - low + 1;
-        uint32_t scaled_value = ((value - low + 1) * total - 1) / range;
-
-        char symbol = 0;
-        for (const auto& pair : ranges) {
-            const SymbolRange& current_range = pair.second;
-            if (scaled_value >= current_range.low && scaled_value < current_range.high) {
-                symbol = pair.first;
-                break;
             }
         }
+        info.code = code_str;
+        decode_map[code_str] = info.symbol;
+    }
 
-        result += symbol;
-        const SymbolRange& current_range = ranges[symbol];
-        high = low + (range * current_range.high) / current_range.count - 1;
-        low = low + (range * current_range.low) / current_range.count;
+    // Decode data
+    ofstream out(outputFile, ios::binary);
+    if (!out) {
+        cerr << "Error: Cannot create output file!" << endl;
+        return;
+    }
 
-        while (true) {
-            if (high < HALF) {
-                low <<= 1;
-                high = (high << 1) | 1;
-                value <<= 1;
-            }
-            else if (low >= HALF) {
-                low = (low - HALF) << 1;
-                high = ((high - HALF) << 1) | 1;
-                value = (value - HALF) << 1;
-            }
-            else if (low >= FIRST_QTR && high < THIRD_QTR) {
-                low = (low - FIRST_QTR) << 1;
-                high = ((high - FIRST_QTR) << 1) | 1;
-                value = (value - FIRST_QTR) << 1;
-            }
-            else break;
+    string current_code;
+    unsigned char byte;
+    while (in.get(reinterpret_cast<char&>(byte))) {
+        for (int i = 7; i >= 0; --i) {
+            char bit = (byte & (1 << i)) ? '1' : '0';
+            current_code += bit;
 
-            if (bit_index < bits.size()) {
-                value |= (bits[bit_index++] ? 1 : 0);
+            auto it = decode_map.find(current_code);
+            if (it != decode_map.end()) {
+                out.put(it->second);
+                current_code.clear();
             }
         }
     }
 
-    out.write(result.data(), result.size());
-
-    auto end = high_resolution_clock::now();
-    auto duration = duration_cast<milliseconds>(end - start);
-
-    cout << "\nDecompression results:\n";
-    cout << "Decompressed size: " << text_size << " bytes\n";
-    cout << "Time taken: " << duration.count() << " ms\n";
+    out.close();
+    cout << "File successfully decoded." << endl;
 }
 
 int main() {
-    setlocale(LC_ALL, "Russian");
-
-    string filename;
-    cout << "Enter filename (exp.txt to compress | encoded.txt to decompress): ";
-    cin >> filename;
-
-    ifstream inFile(filename, ios::binary);
-    if (!inFile) {
-        cout << "Error opening file!" << endl;
-        return 1;
-    }
-
-    string choice;
     cout << "Enter '1' to compress or '2' to decompress: ";
+
+    int choice;
     cin >> choice;
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
 
-    if (choice == "1") {
-        ofstream outFile("encoded.txt", ios::binary);
-        if (!outFile) {
-            cout << "Error creating output file!" << endl;
-            return 1;
-        }
+    cout << "Enter filename (exp.txt to compress | encode.txt to decompress): ";
+    string filename;
+    getline(cin, filename);
 
-        cout << "Compressing..." << endl;
-        compressFile(inFile, outFile);
+    if (choice == 1) {
+        string output = "encode.txt";
+        encodeFile(filename, output);
     }
-    else if (choice == "2") {
-        ofstream outFile("decoded.txt", ios::binary);
-        if (!outFile) {
-            cout << "Error creating output file!" << endl;
-            return 1;
-        }
-
-        cout << "Decompressing..." << endl;
-        decompressFile(inFile, outFile);
+    else if (choice == 2) {
+        string output = "decode.txt";
+        decodeFile(filename, output);
     }
     else {
-        cout << "Invalid choice!" << endl;
+        cerr << "Error: Invalid choice!" << endl;
         return 1;
     }
 
-    inFile.close();
     return 0;
 }
